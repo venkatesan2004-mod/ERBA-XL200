@@ -368,3 +368,144 @@ def start_server():
 if __name__ == "__main__":
     start_server()
 
+import socket
+import threading
+import time
+
+# ASTM control characters
+STX = b'\x02'
+ETX = b'\x03'
+EOT = b'\x04'
+ENQ = b'\x05'
+ACK = b'\x06'
+NAK = b'\x15'
+ETB = b'\x17'
+CR  = b'\x0D'
+LF  = b'\x0A'
+
+MAX_RETRIES = 6  # retry limit
+
+
+def calculate_checksum(data: bytes) -> str:
+    """
+    ASTM checksum: Sum of ASCII values from frame number through ETX/ETB.
+    Returns a 2-digit hex string.
+    """
+    checksum = sum(data) % 256
+    return f"{checksum:02X}"
+
+
+class ASTMHandler:
+    def __init__(self, conn, addr):
+        self.conn = conn
+        self.addr = addr
+        self.retry_count = 0
+        self.buffer = b''
+        self.last_frame = b''
+        print(f"[CONNECTED] {addr}")
+
+    def send(self, data: bytes, label=""):
+        self.conn.sendall(data)
+        print(f"[TX] {label} {repr(data)}")
+
+    def handle(self):
+        try:
+            while True:
+                data = self.conn.recv(1024)
+                if not data:
+                    break
+                for byte in data:
+                    self.process_byte(bytes([byte]))
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        finally:
+            self.conn.close()
+            print(f"[DISCONNECTED] {self.addr}")
+
+    def process_byte(self, byte: bytes):
+        print(f"[RX] {repr(byte)}")
+
+        if byte == ENQ:  # Establishment
+            print("[EVENT] ENQ received → sending ACK")
+            self.send(ACK, "ACK")
+
+        elif byte == EOT:  # Termination
+            print("[EVENT] EOT received → Transmission End")
+            if self.buffer:
+                print(f"[FINAL MESSAGE] {self.buffer.decode(errors='ignore')}")
+            self.buffer = b''
+
+        elif byte == STX:  # Start of frame
+            self.buffer = b''  # reset frame buffer
+            self.buffer += byte
+            print("[EVENT] STX received → starting new frame")
+
+        elif byte in (ETX, ETB):  # End of frame
+            self.buffer += byte
+            marker = "<ETX>" if byte == ETX else "<ETB>"
+            print(f"[EVENT] Frame end marker {marker} received")
+
+        elif byte in (ACK, NAK):
+            if byte == ACK:
+                print("[EVENT] ACK received → transmission continues")
+                self.retry_count = 0
+            else:
+                print("[EVENT] NAK received → retrying last frame")
+                self.retry_count += 1
+                if self.retry_count > MAX_RETRIES:
+                    print("[ERROR] Retry limit exceeded → sending EOT")
+                    self.send(EOT, "EOT")
+                else:
+                    print(f"[RETRY] Resending frame attempt {self.retry_count}")
+                    if self.last_frame:
+                        self.send(self.last_frame, "FRAME RESEND")
+
+        elif byte == CR:
+            self.buffer += byte
+            print("[EVENT] <CR> received")
+
+        elif byte == LF:
+            self.buffer += byte
+            print("[EVENT] <LF> received → frame complete")
+            frame = self.buffer
+            self.buffer = b''
+
+            if len(frame) > 6:
+                payload = frame[1:-5]  # FN..ETX/ETB
+                recv_cksum = frame[-4:-2].decode(errors="ignore")
+                calc_cksum = calculate_checksum(frame[1:-4+1])
+                print(f"[CHECKSUM] recv={recv_cksum}, calc={calc_cksum}")
+
+                if recv_cksum.upper() == calc_cksum.upper():
+                    print("[CHECKSUM OK] Sending ACK")
+                    self.send(ACK, "ACK")
+                    self.last_frame = frame
+                else:
+                    print("[CHECKSUM FAIL] Sending NAK")
+                    self.send(NAK, "NAK")
+            else:
+                print("[FRAME ERROR] Too short, ignored")
+
+        else:
+            self.buffer += byte
+            try:
+                print(f"[PAYLOAD CHAR] {byte.decode(errors='ignore')}")
+            except:
+                print(f"[PAYLOAD RAW] {repr(byte)}")
+
+
+# TCP server wrapper (swap with pyserial for RS232)
+def start_server(host="0.0.0.0", port=8080):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((host, port))
+    server.listen(5)
+    print(f"[SERVER] Listening on {host}:{port}")
+
+    while True:
+        conn, addr = server.accept()
+        handler = ASTMHandler(conn, addr)
+        threading.Thread(target=handler.handle, daemon=True).start()
+
+
+if __name__ == "__main__":
+    start_server()
